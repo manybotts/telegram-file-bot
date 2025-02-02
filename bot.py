@@ -1,268 +1,177 @@
 import os
-import uuid
 import logging
-import asyncio
-from threading import Thread
-from pymongo import MongoClient, errors
-from telegram import Update, Bot, Message, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackContext,
     filters,
     CallbackQueryHandler,
+    CallbackContext,
 )
+import asyncio
 
-# Configure logging
+# Initialize logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Validate environment variables
-REQUIRED_ENV = [
-    "BOT_TOKEN",
-    "MONGO_URI",
-    "ADMINS",
-    "DUMP_CHANNEL_ID",
-    "FORCE_SUB_CHANNELS",
-    "RAILWAY_STATIC_URL"
-]
+# Load environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+FORCE_SUB_CHANNELS = [int(channel_id) for channel_id in os.getenv("FORCE_SUB_CHANNELS", "").split(",") if channel_id]
 
-try:
-    BOT_TOKEN = os.environ["BOT_TOKEN"]
-    MONGO_URI = os.environ["MONGO_URI"]
-    ADMINS = [int(admin) for admin in os.environ["ADMINS"].split(",")]
-    DUMP_CHANNEL_ID = int(os.environ["DUMP_CHANNEL_ID"])
-    FORCE_SUB_CHANNELS = [int(channel) for channel in os.environ["FORCE_SUB_CHANNELS"].split(",")]
-    RAILWAY_DOMAIN = os.environ["RAILWAY_STATIC_URL"]
-except KeyError as e:
-    logger.error(f"Missing required environment variable: {e}")
-    exit(1)
-except ValueError as e:
-    logger.error(f"Invalid environment variable format: {e}")
-    exit(1)
-
-# Database setup with error handling
-try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    client.server_info()  # Test connection
-    db = client.telegram_file_bot
-    files_collection = db.files
-    batches_collection = db.batches
-    
-    # Create indexes
-    files_collection.create_index("file_id", unique=True)
-    batches_collection.create_index("batch_id", unique=True)
-    batches_collection.create_index("media_group", unique=True)
-except errors.ConnectionFailure:
-    logger.error("Failed to connect to MongoDB")
-    exit(1)
-except errors.PyMongoError as e:
-    logger.error(f"MongoDB error: {e}")
-    exit(1)
-
-async def setup_webhook(bot: Bot):
-    """Automatically configure webhook on startup"""
-    webhook_url = f"https://{RAILWAY_DOMAIN}/webhook/{BOT_TOKEN}"
-    
-    try:
-        result = await bot.set_webhook(webhook_url)
-        if result:
-            logger.info(f"Webhook set successfully: {webhook_url}")
-        else:
-            logger.error("Webhook setup failed")
-            exit(1)
-    except Exception as e:
-        logger.error(f"Webhook configuration error: {e}")
-        exit(1)
-
-async def start(update: Update, context: CallbackContext):
-    """Handle start command with deep linking"""
-    try:
-        if context.args:
-            file_id = context.args[0]
-            await handle_file_request(update, context, file_id)
-        else:
-            await update.message.reply_text(
-                "🔒 Secure File Sharing Bot\n\n"
-                "Admins can upload files to generate shareable links. "
-                "Users need to join required channels to access content."
-            )
-    except Exception as e:
-        logger.error(f"Start command error: {e}")
-
-async def handle_admin_upload(update: Update, context: CallbackContext):
-    """Process admin file uploads"""
-    try:
-        user = update.effective_user
-        if user.id not in ADMINS:
-            await update.message.reply_text("⛔ Admin access required")
-            return
-
-        message = update.effective_message
-        if message.media_group_id:
-            await process_batch_files(message, user)
-        else:
-            await process_single_file(message, user)
-    except Exception as e:
-        logger.error(f"Upload handling error: {e}")
-        await update.message.reply_text("⚠️ Error processing files")
-
-async def process_single_file(message: Message, user):
-    """Handle single file upload"""
-    try:
-        file_id = str(uuid.uuid4())
-        forwarded = await message.forward(DUMP_CHANNEL_ID)
-        
-        files_collection.insert_one({
-            "file_id": file_id,
-            "message_id": forwarded.message_id,
-            "type": "single",
-            "owner": user.id
-        })
-        
-        share_link = f"https://t.me/{message.bot.username}?start={file_id}"
-        await message.reply_text(f"✅ File stored!\n🔗 Permanent link: {share_link}")
-    except Exception as e:
-        logger.error(f"Single file error: {e}")
-        await message.reply_text("⚠️ Failed to process file")
-
-async def process_batch_files(message: Message, user):
-    """Handle batch file upload"""
-    try:
-        media_group = message.media_group_id
-        if batches_collection.find_one({"media_group": media_group}):
-            return
-
-        batch_id = str(uuid.uuid4())
-        batches_collection.insert_one({
-            "batch_id": batch_id,
-            "media_group": media_group,
-            "owner": user.id,
-            "message_ids": []
-        })
-
-        messages = await message.bot.get_media_group(
-            chat_id=message.chat_id,
-            message_id=message.message_id
-        )
-
-        for msg in messages:
-            forwarded = await msg.forward(DUMP_CHANNEL_ID)
-            batches_collection.update_one(
-                {"batch_id": batch_id},
-                {"$push": {"message_ids": forwarded.message_id}}
-            )
-
-        share_link = f"https://t.me/{message.bot.username}?start={batch_id}"
-        await message.reply_text(f"✅ Batch stored!\n🔗 Permanent link: {share_link}")
-    except Exception as e:
-        logger.error(f"Batch processing error: {e}")
-        await message.reply_text("⚠️ Failed to process batch")
-
-async def handle_file_request(update: Update, context: CallbackContext, file_id: str):
-    """Handle file access requests"""
-    try:
-        user = update.effective_user
-        if not await verify_subscription(user.id, context.bot):
-            await show_subscription_required(update, context, file_id)
-            return
-
-        # Retrieve and send files
-        file_data = files_collection.find_one({"file_id": file_id})
-        batch_data = batches_collection.find_one({"batch_id": file_id})
-
-        if file_data:
-            await context.bot.forward_message(
-                chat_id=user.id,
-                from_chat_id=DUMP_CHANNEL_ID,
-                message_id=file_data["message_id"]
-            )
-        elif batch_data:
-            for msg_id in batch_data["message_ids"]:
-                await context.bot.forward_message(
-                    chat_id=user.id,
-                    from_chat_id=DUMP_CHANNEL_ID,
-                    message_id=msg_id
-                )
-        else:
-            await update.message.reply_text("⚠️ Invalid or expired link")
-    except Exception as e:
-        logger.error(f"File request error: {e}")
-
-async def verify_subscription(user_id: int, bot: Bot) -> bool:
-    """Check channel subscriptions"""
+# Helper functions
+async def verify_subscription(user_id: int, bot):
+    """Verify if a user is subscribed to all required channels."""
     try:
         for channel_id in FORCE_SUB_CHANNELS:
-            member = await bot.get_chat_member(channel_id, user_id)
-            if member.status in ["left", "kicked"]:
+            chat_member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            if chat_member.status in ["left", "kicked"]:
                 return False
         return True
     except Exception as e:
-        logger.error(f"Subscription check error: {e}")
+        logger.error(f"Subscription verification error: {e}")
         return False
 
-async def show_subscription_required(update: Update, context: CallbackContext, file_id: str):
-    """Show subscription prompt with buttons"""
-    try:
-        buttons = []
-        for channel_id in FORCE_SUB_CHANNELS:
-            channel = await context.bot.get_chat(channel_id)
-            buttons.append([InlineKeyboardButton(
-                text=f"Join {channel.title}",
-                url=f"https://t.me/{channel.username}"
-            )])
-        
-        buttons.append([InlineKeyboardButton(
-            text="✅ I've Joined - Try Again",
-            callback_data=f"verify_{file_id}"
-        )])
 
-        await update.message.reply_text(
-            "📢 You must join these channels to access content:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+# Handlers
+async def start(update: Update, context: CallbackContext):
+    """Handle /start command."""
+    try:
+        file_id = None
+        if context.args and len(context.args) > 0:
+            file_id = context.args[0]
+
+        if not await verify_subscription(update.effective_user.id, context.bot):
+            buttons = []
+            for channel_id in FORCE_SUB_CHANNELS:
+                channel = await context.bot.get_chat(channel_id)
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"Join {channel.title}",
+                            url=f"https://t.me/{channel.username}",
+                        )
+                    ]
+                )
+
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="✅ I've Joined - Try Again",
+                        callback_data=f"verify_{file_id}" if file_id else "verify",
+                    )
+                ]
+            )
+            await update.message.reply_text(
+                "📢 You must join these channels to access content:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
+
+        if file_id:
+            await handle_file_request(update, context, file_id)
+        else:
+            await update.message.reply_text("Welcome! Use this bot to access content.")
     except Exception as e:
-        logger.error(f"Subscription prompt error: {e}")
+        logger.error(f"Start command error: {e}")
+
+
+async def handle_admin_upload(update: Update, context: CallbackContext):
+    """Handle file uploads from admins."""
+    try:
+        if update.effective_user.id not in ADMINS:
+            await update.message.reply_text("You are not authorized to upload files.")
+            return
+
+        # Process uploaded file (store it, generate link, etc.)
+        file_obj = update.message.document or update.message.photo[-1] or update.message.video
+        file_info = await context.bot.get_file(file_obj.file_id)
+
+        # Store file metadata in a database or other storage
+        file_id = file_obj.file_id
+        file_unique_id = file_obj.file_unique_id
+
+        # Example: Save file details to a database (replace with actual DB logic)
+        logger.info(f"File uploaded: {file_unique_id}")
+
+        # Generate and send file link
+        file_link = f"https://t.me/{context.bot.username}?start={file_unique_id}"
+        await update.message.reply_text(f"File uploaded successfully!\nLink: {file_link}")
+    except Exception as e:
+        logger.error(f"File upload error: {e}")
+
 
 async def handle_callback(update: Update, context: CallbackContext):
-    """Handle callback queries"""
+    """Handle callback queries."""
     try:
         query = update.callback_query
+        await query.answer()
+
         if query.data.startswith("verify_"):
-            file_id = query.data.split("_")[1]
+            file_id = query.data.split("_")[1] if "_" in query.data else None
             if await verify_subscription(query.from_user.id, context.bot):
                 await query.message.delete()
-                await handle_file_request(update, context, file_id)
+                if file_id:
+                    await handle_file_request(update, context, file_id)
+                else:
+                    await query.message.reply_text("You are now verified!")
             else:
-                await query.answer("Please join all channels first!", show_alert=True)
+                await query.message.edit_text(
+                    "Please join all channels to access content.", show_alert=True
+                )
     except Exception as e:
         logger.error(f"Callback error: {e}")
 
+
+async def handle_file_request(update: Update, context: CallbackContext, file_id: str):
+    """Handle file requests by sending the file to the user."""
+    try:
+        # Example: Fetch file details from database or storage (replace with actual logic)
+        file_info = {"file_id": file_id}  # Replace with actual file retrieval logic
+
+        if not file_info:
+            await update.message.reply_text("File not found.")
+            return
+
+        await context.bot.send_document(chat_id=update.effective_chat.id, document=file_info["file_id"])
+    except Exception as e:
+        logger.error(f"File request error: {e}")
+
+
+# Main application setup
 async def main():
-    """Main application setup"""
     try:
         application = Application.builder().token(BOT_TOKEN).build()
-        
+
         # Register handlers
-        application.add_handlers([
-            CommandHandler("start", start),
-            MessageHandler(filters.Document | filters.PHOTO | filters.VIDEO, handle_admin_upload),
-            CallbackQueryHandler(handle_callback)
-        ])
+        application.add_handlers(
+            [
+                CommandHandler("start", start),
+                # Corrected filters for handling documents, photos, and videos
+                MessageHandler(
+                    filters.Document.ALL | filters.PHOTO.ALL | filters.VIDEO.ALL,
+                    handle_admin_upload,
+                ),
+                CallbackQueryHandler(handle_callback),
+            ]
+        )
 
         # Auto-configure webhook in production
-        await setup_webhook(application.bot)
-        
-        logger.info("Bot is running")
-        await application.run_polling()
+        if RAILWAY_STATIC_URL := os.getenv("RAILWAY_STATIC_URL"):
+            webhook_url = f"{RAILWAY_STATIC_URL}/"
+            await application.bot.set_webhook(url=webhook_url)
+            logger.info(f"Webhook set successfully: {webhook_url}")
+        else:
+            logger.warning("RAILWAY_STATIC_URL not set. Running in polling mode.")
+            await application.run_polling()
 
+        logger.info("Bot is running")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         exit(1)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
