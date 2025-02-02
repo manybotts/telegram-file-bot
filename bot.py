@@ -152,7 +152,7 @@ async def main():
                 CommandHandler("start", start),
                 # Corrected filters for handling documents, photos, and videos
                 MessageHandler(
-                    filters.Document.ALL | filters.PHOTO | filters.VIDEO.ALL,
+                    filters.Document.ALL | filters.PHOTO | filters.VIDEO,
                     handle_admin_upload,
                 ),
                 CallbackQueryHandler(handle_callback),
