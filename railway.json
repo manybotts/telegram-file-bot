@@ -1,0 +1,13 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "config": {
+      "nixpacks": {
+        "providers": ["python"]
+      }
+    }
+  },
+  "deploy": {
+    "startCommand": "python -m bot"
+  }
+}
