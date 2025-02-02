@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FORCE_SUB_CHANNELS = [int(channel_id) for channel_id in os.getenv("FORCE_SUB_CHANNELS", "").split(",") if channel_id]
+ADMINS = [int(admin_id) for admin_id in os.getenv("ADMINS", "").split(",") if admin_id]
 
 # Helper functions
 async def verify_subscription(user_id: int, bot):
@@ -151,7 +152,7 @@ async def main():
                 CommandHandler("start", start),
                 # Corrected filters for handling documents, photos, and videos
                 MessageHandler(
-                    filters.Document.ALL | filters.PHOTO.ALL | filters.VIDEO.ALL,
+                    filters.Document.ALL | filters.PHOTO | filters.VIDEO.ALL,
                     handle_admin_upload,
                 ),
                 CallbackQueryHandler(handle_callback),
