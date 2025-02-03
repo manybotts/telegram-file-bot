@@ -88,8 +88,10 @@ async def serve_file(file_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
-    # Check membership
+    # Extract user ID from file ID
     user_id = int(file_id.split("_")[0])
+
+    # Check membership
     if not await check_membership(user_id, application.bot):
         keyboard = [
             [InlineKeyboardButton(f"Join Channel {i+1}", url=f"t.me/{cid}") for i, cid in enumerate(FORCE_SUBS)],
@@ -117,8 +119,10 @@ async def serve_batch(batch_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
         )
 
-    # Check membership
+    # Extract user ID from batch ID
     user_id = int(batch_id.split("_")[0])
+
+    # Check membership
     if not await check_membership(user_id, application.bot):
         keyboard = [
             [InlineKeyboardButton(f"Join Channel {i+1}", url=f"t.me/{cid}") for i, cid in enumerate(FORCE_SUBS)],
