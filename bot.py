@@ -1,8 +1,8 @@
 import os
 import logging
 import uuid
-from typing import Dict, List
 from datetime import datetime
+from typing import Dict, List
 
 from telegram import (
     Update,
@@ -215,19 +215,21 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_callback))
     
     # Webhook setup
-    @web_app.post(f"/telegram")
+    @web_app.post("/telegram")
     async def process_webhook(request: Request):
         data = await request.json()
         update = Update.de_json(data, app.bot)
         await app.update_queue.put(update)
         return {"status": "ok"}
 
+    webhook_url = f"{BASE_DOMAIN}/telegram"
+    
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
+        webhook_url=webhook_url,
         secret_token=WEBHOOK_SECRET,
-        webhook_url=f"{BASE_DOMAIN}/telegram",
-        fastapi_app=web_app,
+        fastapi_app=web_app
     )
 
 if __name__ == "__main__":
