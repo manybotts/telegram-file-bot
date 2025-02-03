@@ -1,6 +1,5 @@
-python-telegram-bot[webhooks]==20.3
-   pymongo[srv]
-   fastapi
-   uvicorn
-   python-multipart
-   python-dotenv
+python-telegram-bot[webhooks]>=20.5
+fastapi>=0.95.0
+uvicorn>=0.21.0
+pymongo[srv]>=4.3.3
+python-dotenv>=0.21.0
