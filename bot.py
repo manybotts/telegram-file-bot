@@ -22,6 +22,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
 import uvicorn
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -113,14 +114,30 @@ async def startup():
     await application.initialize()
     await application.start()
 
-    # Set webhook URL
-    webhook_url = f"{RAILWAY_STATIC_URL}/telegram"
-    logger.info(f"Setting webhook to: {webhook_url}")
-    await application.bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-    )
-    logger.info("Webhook setup completed")
+    # Check and set webhook
+    webhook_info = await application.bot.get_webhook_info()
+    expected_url = f"{RAILWAY_STATIC_URL}/telegram"
+
+    if webhook_info.url != expected_url or webhook_info.last_error_date:
+        logger.info(f"Setting webhook to: {expected_url}")
+        while True:
+            try:
+                await application.bot.set_webhook(
+                    url=expected_url,
+                    secret_token=WEBHOOK_SECRET,
+                )
+                break
+            except Exception as e:
+                logger.error(f"Failed to set webhook: {e}")
+                if "Flood control exceeded" in str(e):
+                    logger.info("Flood control triggered. Retrying in 1 second...")
+                    await asyncio.sleep(1)
+                else:
+                    raise  # Re-raise other exceptions
+    else:
+        logger.info("Webhook already configured correctly")
+
+    logger.info("Bot startup complete")
 
 
 # Shutdown event for FastAPI
