@@ -23,6 +23,7 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
+import uvicorn
 
 # Configure logging
 logging.basicConfig(
@@ -202,34 +203,43 @@ Storage Used: {db.command("dbstats")['dataSize']/1024/1024:.2f} MB"""
     await update.message.reply_text(stats_msg)
 
 def main() -> None:
-    app = ApplicationBuilder().token(BOT_TOKEN).updater(None).build()
-    
-    # Command handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("batch", handle_batch))
-    app.add_handler(CommandHandler("endbatch", end_batch))
-    app.add_handler(CommandHandler("stats", stats))
-    
-    # File handlers
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, store_file))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Webhook setup
+    # Initialize Telegram application
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Register handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("batch", handle_batch))
+    application.add_handler(CommandHandler("endbatch", end_batch))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, store_file))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Webhook configuration
+    @web_app.on_event("startup")
+    async def initialize():
+        await application.initialize()
+        await application.start()
+        await application.updater.start_webhook(
+            listen="0.0.0.0",
+            port=int(os.getenv("PORT", 8000)),
+            url_path=BOT_TOKEN,
+            webhook_url=f"{BASE_DOMAIN}/telegram",
+            secret_token=WEBHOOK_SECRET
+        )
+
     @web_app.post("/telegram")
     async def process_webhook(request: Request):
         data = await request.json()
-        update = Update.de_json(data, app.bot)
-        await app.update_queue.put(update)
+        update = Update.de_json(data, application.bot)
+        await application.update_queue.put(update)
         return {"status": "ok"}
 
-    webhook_url = f"{BASE_DOMAIN}/telegram"
-    
-    app.run_webhook(
-        listen="0.0.0.0",
+    # Start the server
+    uvicorn.run(
+        web_app,
+        host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
-        webhook_url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-        fastapi_app=web_app
+        log_level="info"
     )
 
 if __name__ == "__main__":
