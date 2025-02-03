@@ -1,178 +1,234 @@
 import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import uuid
+from typing import Dict, List
+from datetime import datetime
+
+from telegram import (
+    Update,
+    Bot,
+    InputMediaDocument,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
+    ContextTypes,
     CommandHandler,
     MessageHandler,
     filters,
     CallbackQueryHandler,
-    CallbackContext,
 )
-import asyncio
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from fastapi import FastAPI, Request
+from fastapi.responses import RedirectResponse
 
-# Initialize logging
+# Configure logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-FORCE_SUB_CHANNELS = [int(channel_id) for channel_id in os.getenv("FORCE_SUB_CHANNELS", "").split(",") if channel_id]
-ADMINS = [int(admin_id) for admin_id in os.getenv("ADMINS", "").split(",") if admin_id]
+ADMINS = list(map(int, os.getenv("ADMINS").split(",")))
+DUMP_CHANNEL = int(os.getenv("DUMP_CHANNEL"))
+FORCE_SUBS = list(map(int, os.getenv("FORCE_SUBS").split(",")))
+DATABASE_URL = os.getenv("DATABASE_URL")
+RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL")
+CUSTOM_DOMAIN = os.getenv("CUSTOM_DOMAIN", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "DEFAULT_SECRET")
+BOT_USERNAME = os.getenv("BOT_USERNAME")
 
-# Helper functions
-async def verify_subscription(user_id: int, bot):
-    """Verify if a user is subscribed to all required channels."""
+# Database setup
+client = MongoClient(DATABASE_URL)
+db = client.file_bot_db
+
+users_col: Collection = db.users
+files_col: Collection = db.files
+batches_col: Collection = db.batches
+
+# FastAPI setup
+web_app = FastAPI()
+BASE_DOMAIN = CUSTOM_DOMAIN or RAILWAY_STATIC_URL
+
+# Utility functions
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
+
+async def check_membership(user_id: int, bot: Bot) -> bool:
     try:
-        for channel_id in FORCE_SUB_CHANNELS:
-            chat_member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-            if chat_member.status in ["left", "kicked"]:
+        for channel_id in FORCE_SUBS:
+            member = await bot.get_chat_member(channel_id, user_id)
+            if member.status in ["left", "kicked"]:
                 return False
         return True
     except Exception as e:
-        logger.error(f"Subscription verification error: {e}")
+        logger.error(f"Membership check error: {e}")
         return False
 
+def generate_link(file_id: str, is_batch: bool = False) -> str:
+    link_type = "batch" if is_batch else "file"
+    return f"{BASE_DOMAIN}/get/{link_type}/{file_id}"
 
-# Handlers
-async def start(update: Update, context: CallbackContext):
-    """Handle /start command."""
-    try:
-        file_id = None
-        if context.args and len(context.args) > 0:
-            file_id = context.args[0]
+# Web endpoints
+@web_app.get("/get/file/{file_id}")
+async def serve_file(request: Request, file_id: str):
+    return RedirectResponse(f"https://t.me/{BOT_USERNAME}?start=file_{file_id}")
 
-        if not await verify_subscription(update.effective_user.id, context.bot):
-            buttons = []
-            for channel_id in FORCE_SUB_CHANNELS:
-                channel = await context.bot.get_chat(channel_id)
-                buttons.append(
-                    [
-                        InlineKeyboardButton(
-                            text=f"Join {channel.title}",
-                            url=f"https://t.me/{channel.username}",
-                        )
-                    ]
-                )
+@web_app.get("/get/batch/{batch_id}")
+async def serve_batch(request: Request, batch_id: str):
+    return RedirectResponse(f"https://t.me/{BOT_USERNAME}?start=batch_{batch_id}")
 
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text="✅ I've Joined - Try Again",
-                        callback_data=f"verify_{file_id}" if file_id else "verify",
-                    )
-                ]
-            )
-            await update.message.reply_text(
-                "📢 You must join these channels to access content:",
-                reply_markup=InlineKeyboardMarkup(buttons),
-            )
-            return
+@web_app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
 
-        if file_id:
-            await handle_file_request(update, context, file_id)
+# Telegram bot handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    users_col.update_one(
+        {"_id": user_id},
+        {"$set": {"username": update.effective_user.username}},
+        upsert=True,
+    )
+
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("file_"):
+            await handle_file_request(update, context, arg[5:])
+        elif arg.startswith("batch_"):
+            await handle_batch_request(update, context, arg[6:])
+    else:
+        if await is_admin(user_id):
+            await update.message.reply_text("Admin panel ready. Send files or use /batch")
         else:
-            await update.message.reply_text("Welcome! Use this bot to access content.")
-    except Exception as e:
-        logger.error(f"Start command error: {e}")
+            await update.message.reply_text("You need special access to use this bot")
 
+async def handle_file_request(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
+    user_id = update.effective_user.id
+    if not (file_data := files_col.find_one({"_id": file_id})):
+        await update.message.reply_text("File not found")
+        return
 
-async def handle_admin_upload(update: Update, context: CallbackContext):
-    """Handle file uploads from admins."""
-    try:
-        if update.effective_user.id not in ADMINS:
-            await update.message.reply_text("You are not authorized to upload files.")
-            return
-
-        # Process uploaded file (store it, generate link, etc.)
-        file_obj = update.message.document or update.message.photo[-1] or update.message.video
-        file_info = await context.bot.get_file(file_obj.file_id)
-
-        # Store file metadata in a database or other storage
-        file_id = file_obj.file_id
-        file_unique_id = file_obj.file_unique_id
-
-        # Example: Save file details to a database (replace with actual DB logic)
-        logger.info(f"File uploaded: {file_unique_id}")
-
-        # Generate and send file link
-        file_link = f"https://t.me/{context.bot.username}?start={file_unique_id}"
-        await update.message.reply_text(f"File uploaded successfully!\nLink: {file_link}")
-    except Exception as e:
-        logger.error(f"File upload error: {e}")
-
-
-async def handle_callback(update: Update, context: CallbackContext):
-    """Handle callback queries."""
-    try:
-        query = update.callback_query
-        await query.answer()
-
-        if query.data.startswith("verify_"):
-            file_id = query.data.split("_")[1] if "_" in query.data else None
-            if await verify_subscription(query.from_user.id, context.bot):
-                await query.message.delete()
-                if file_id:
-                    await handle_file_request(update, context, file_id)
-                else:
-                    await query.message.reply_text("You are now verified!")
-            else:
-                await query.message.edit_text(
-                    "Please join all channels to access content.", show_alert=True
-                )
-    except Exception as e:
-        logger.error(f"Callback error: {e}")
-
-
-async def handle_file_request(update: Update, context: CallbackContext, file_id: str):
-    """Handle file requests by sending the file to the user."""
-    try:
-        # Example: Fetch file details from database or storage (replace with actual logic)
-        file_info = {"file_id": file_id}  # Replace with actual file retrieval logic
-
-        if not file_info:
-            await update.message.reply_text("File not found.")
-            return
-
-        await context.bot.send_document(chat_id=update.effective_chat.id, document=file_info["file_id"])
-    except Exception as e:
-        logger.error(f"File request error: {e}")
-
-
-# Main application setup
-async def main():
-    try:
-        application = Application.builder().token(BOT_TOKEN).build()
-
-        # Register handlers
-        application.add_handlers(
-            [
-                CommandHandler("start", start),
-                # Corrected filters for handling documents, photos, and videos
-                MessageHandler(
-                    filters.Document.ALL | filters.PHOTO | filters.VIDEO,
-                    handle_admin_upload,
-                ),
-                CallbackQueryHandler(handle_callback),
-            ]
+    if await check_membership(user_id, context.bot):
+        await context.bot.copy_message(user_id, DUMP_CHANNEL, file_data["message_id"])
+    else:
+        keyboard = [
+            [InlineKeyboardButton(f"Join Channel {i+1}", url=f"t.me/{cid}") 
+             for i, cid in enumerate(FORCE_SUBS)],
+            [InlineKeyboardButton("Try Again", callback_data=f"verify_{file_id}")]
+        ]
+        await update.message.reply_text(
+            "Join required channels first!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-        # Auto-configure webhook in production
-        if RAILWAY_STATIC_URL := os.getenv("RAILWAY_STATIC_URL"):
-            webhook_url = f"{RAILWAY_STATIC_URL}/"
-            await application.bot.set_webhook(url=webhook_url)
-            logger.info(f"Webhook set successfully: {webhook_url}")
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith("verify_"):
+        file_id = query.data[7:]
+        if await check_membership(query.from_user.id, query.bot):
+            file_data = files_col.find_one({"_id": file_id})
+            await query.bot.copy_message(query.from_user.id, DUMP_CHANNEL, file_data["message_id"])
+            await query.message.delete()
         else:
-            logger.warning("RAILWAY_STATIC_URL not set. Running in polling mode.")
-            await application.run_polling()
+            await query.message.reply_text("Still not joined all channels!")
 
-        logger.info("Bot is running")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        exit(1)
+async def store_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        return
 
+    msg = await update.message.forward(DUMP_CHANNEL)
+    file = update.message.document or update.message.photo[-1] if update.message.photo else None
+    
+    file_id = str(uuid.uuid4())
+    files_col.insert_one({
+        "_id": file_id,
+        "message_id": msg.message_id,
+        "file_id": file.file_id,
+        "timestamp": datetime.now(),
+        "uploader": user_id
+    })
+    
+    await update.message.reply_text(f"File stored!\nPermanent Link: {generate_link(file_id)}")
+
+async def handle_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await is_admin(user_id):
+        return
+
+    if not context.user_data.get("batch_mode"):
+        context.user_data["batch_mode"] = True
+        context.user_data["batch_files"] = []
+        await update.message.reply_text("Batch mode activated! Send files now. /endbatch when done")
+    else:
+        context.user_data["batch_files"].append(update.message)
+        await update.message.reply_text("File added to batch!")
+
+async def end_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not (files := context.user_data.get("batch_files")):
+        await update.message.reply_text("No files in batch!")
+        return
+
+    batch_id = str(uuid.uuid4())
+    messages = [await f.forward(DUMP_CHANNEL) for f in files]
+    
+    batches_col.insert_one({
+        "_id": batch_id,
+        "files": [{
+            "message_id": m.message_id,
+            "file_id": f.document.file_id
+        } for m, f in zip(messages, files)],
+        "timestamp": datetime.now()
+    })
+    
+    await update.message.reply_text(f"Batch stored!\nPermanent Link: {generate_link(batch_id, True)}")
+    context.user_data.clear()
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id):
+        return
+    
+    stats_msg = f"""📊 Bot Statistics:
+Users: {users_col.count_documents({})}
+Files: {files_col.count_documents({})}
+Batches: {batches_col.count_documents({})}
+Storage Used: {db.command("dbstats")['dataSize']/1024/1024:.2f} MB"""
+    await update.message.reply_text(stats_msg)
+
+def main() -> None:
+    app = ApplicationBuilder().token(BOT_TOKEN).updater(None).build()
+    
+    # Command handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("batch", handle_batch))
+    app.add_handler(CommandHandler("endbatch", end_batch))
+    app.add_handler(CommandHandler("stats", stats))
+    
+    # File handlers
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, store_file))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    
+    # Webhook setup
+    @web_app.post(f"/telegram")
+    async def process_webhook(request: Request):
+        data = await request.json()
+        update = Update.de_json(data, app.bot)
+        await app.update_queue.put(update)
+        return {"status": "ok"}
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        secret_token=WEBHOOK_SECRET,
+        webhook_url=f"{BASE_DOMAIN}/telegram",
+        fastapi_app=web_app,
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
